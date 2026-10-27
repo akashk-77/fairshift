@@ -50,7 +50,23 @@ async def security_headers(request: Request, call_next):
 
 @app.get("/healthz")
 def healthz():
+    """Liveness probe: confirms the ASGI process is responding."""
     return {"ok": True}
+
+
+@app.get("/readyz")
+def readyz():
+    """Readiness probe: verifies the configured database is reachable."""
+    from fastapi import HTTPException
+    conn = connect()
+    try:
+        conn.execute("SELECT 1").fetchone()
+    except Exception:
+        log.exception("Readiness check failed")
+        raise HTTPException(status_code=503, detail="Service not ready")
+    finally:
+        conn.close()
+    return {"ready": True}
 
 
 @app.get("/", include_in_schema=False)

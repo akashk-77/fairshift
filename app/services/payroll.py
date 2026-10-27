@@ -1,24 +1,57 @@
-"""Pure payroll logic: daily overtime + simple statutory deductions (illustrative rates)."""
+"""Payroll calculations with local-calendar-day overtime.
+
+Rates in this module are illustrative configuration, not legal payroll advice.
+"""
 from collections import defaultdict
 from datetime import datetime, timedelta
 
-PF_RATE = 0.12          # on basic pay
-ESI_RATE = 0.0075       # employee share, only if gross <= ESI_LIMIT
+PF_RATE = 0.12          # illustrative employee contribution on basic pay
+ESI_RATE = 0.0075       # illustrative employee share, only if gross <= ESI_LIMIT
 ESI_LIMIT = 21000.0
 
 
 def shift_hours(start: datetime, end: datetime) -> float:
+    """Return non-negative elapsed hours; invalid/reversed intervals count as zero."""
     return max(0.0, (end - start).total_seconds() / 3600)
+
+
+def _hours_by_local_day(start: datetime, end: datetime, tz_min: int) -> dict:
+    """Split an interval at local midnight, retaining UTC-aware input timestamps."""
+    daily = defaultdict(float)
+    if end <= start:
+        return daily
+    offset = timedelta(minutes=tz_min)
+    cursor = start
+    while cursor < end:
+        local_cursor = cursor + offset
+        next_local_midnight = (local_cursor.replace(hour=0, minute=0, second=0, microsecond=0)
+                               + timedelta(days=1))
+        next_boundary_utc = next_local_midnight - offset
+        segment_end = min(end, next_boundary_utc)
+        if segment_end <= cursor:  # defensive guard against malformed timezone inputs
+            break
+        daily[local_cursor.date()] += (segment_end - cursor).total_seconds() / 3600
+        cursor = segment_end
+    return daily
 
 
 def compute_payslip(shifts: list[tuple[datetime, datetime]], rate: float,
                     std_hours: float, ot_mult: float, tz_min: int) -> dict:
-    """Overtime = hours beyond `std_hours` on the same local calendar day."""
+    """Calculate daily overtime after splitting overnight shifts at local midnight.
+
+    This is a transparent demo calculation. Production payroll must use validated,
+    jurisdiction-specific rules and approved contribution bases/rates.
+    """
+    if rate < 0 or std_hours <= 0 or ot_mult < 1:
+        raise ValueError("rate must be non-negative, std_hours positive, and ot_mult >= 1")
     per_day: dict = defaultdict(float)
-    for s, e in shifts:
-        per_day[(s + timedelta(minutes=tz_min)).date()] += shift_hours(s, e)
-    regular = sum(min(h, std_hours) for h in per_day.values())
-    overtime = sum(max(0.0, h - std_hours) for h in per_day.values())
+    for start, end in shifts:
+        if end < start:
+            raise ValueError("shift end must not be before shift start")
+        for day, hours in _hours_by_local_day(start, end, tz_min).items():
+            per_day[day] += hours
+    regular = sum(min(hours, std_hours) for hours in per_day.values())
+    overtime = sum(max(0.0, hours - std_hours) for hours in per_day.values())
     basic = regular * rate
     ot_pay = overtime * rate * ot_mult
     gross = basic + ot_pay

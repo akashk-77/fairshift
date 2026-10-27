@@ -18,6 +18,18 @@ def connect() -> sqlite3.Connection:
 def init_db() -> None:
     conn = connect()
     try:
+        # Do not silently discard or rewrite legacy attendance records. Explain how to
+        # resolve duplicates before installing the new uniqueness invariant.
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='shifts'").fetchone():
+            duplicates = conn.execute(
+                "SELECT worker_id, COUNT(*) n FROM shifts WHERE check_out IS NULL "
+                "GROUP BY worker_id HAVING COUNT(*) > 1 LIMIT 1"
+            ).fetchone()
+            if duplicates:
+                raise RuntimeError(
+                    "Database contains multiple open shifts for one worker. Review and close "
+                    "duplicate records before starting FairShift; no records were changed."
+                )
         cols = [r[1] for r in conn.execute("PRAGMA table_info(feedback)")]
         if cols and "topic" not in cols:  # older DB: rebuild feedback so manager_id is nullable + topic exists
             conn.execute("PRAGMA foreign_keys=OFF")

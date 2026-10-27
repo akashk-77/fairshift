@@ -11,7 +11,9 @@ def _env_or_random(name: str, nbytes: int) -> str:
     v = os.getenv(name)
     if v:
         return v
-    log.warning("%s not set: generated a temporary value (set it via Secret Manager in production)", name)
+    if os.getenv("APP_ENV", "development").lower() == "production":
+        raise RuntimeError(f"{name} must be explicitly configured in production")
+    log.warning("%s not set: generated a temporary development value", name)
     return secrets.token_urlsafe(nbytes)
 
 
@@ -20,12 +22,20 @@ _SEED = os.getenv("SEED_DEMO", "1") == "1"
 
 
 def _admin_password() -> str:
-    if os.getenv("ADMIN_PASSWORD"):
-        return os.environ["ADMIN_PASSWORD"]
-    if _SEED:  # demo mode: documented default so judges/teammates can log in
-        log.warning("ADMIN_PASSWORD not set: using demo password '%s'. Set ADMIN_PASSWORD for real use.", DEMO_ADMIN_PASSWORD)
+    supplied = os.getenv("ADMIN_PASSWORD")
+    production = os.getenv("APP_ENV", "development").lower() == "production"
+    if production:
+        if not supplied or supplied == DEMO_ADMIN_PASSWORD or len(supplied) < 14:
+            raise RuntimeError("Production requires ADMIN_PASSWORD of at least 14 characters; demo credentials are forbidden")
+        if _SEED:
+            raise RuntimeError("SEED_DEMO=1 is forbidden in production; set SEED_DEMO=0")
+        return supplied
+    if supplied:
+        return supplied
+    if _SEED:  # local-only convenience for the documented demo
+        log.warning("Using local demo admin password. Never expose this configuration publicly.")
         return DEMO_ADMIN_PASSWORD
-    return _env_or_random("ADMIN_PASSWORD", 9)
+    return _env_or_random("ADMIN_PASSWORD", 18)
 
 
 @dataclass(frozen=True)

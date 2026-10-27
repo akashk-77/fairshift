@@ -3,6 +3,7 @@ import hmac
 import io
 import math
 import re
+import sqlite3
 import time
 from datetime import datetime, timedelta
 from typing import Literal
@@ -68,7 +69,7 @@ def _hours(row) -> float:
 
 @router.get("/meta")
 def meta():
-    return {"demo": settings.seed_demo, "admin_hint": settings.admin_password if settings.admin_is_demo else None}
+    return {"demo": settings.seed_demo}
 
 
 # ---------- auth ----------
@@ -147,8 +148,14 @@ def check_in(body: CheckIn, claims=Depends(worker_claims), db=Depends(get_db)):
             raise HTTPException(409, "Already checked in")
         db.execute("UPDATE shifts SET check_out=?, auto_closed=1 WHERE id=?",
                    (tu.iso(cin + timedelta(hours=w["std_daily_hours"])), open_["id"]))
-    db.execute("INSERT INTO shifts(worker_id,site_id,check_in,method) VALUES(?,?,?,?)",
-               (w["id"], w["site_id"], tu.iso(now), method))
+    try:
+        db.execute("INSERT INTO shifts(worker_id,site_id,check_in,method) VALUES(?,?,?,?)",
+                   (w["id"], w["site_id"], tu.iso(now), method))
+    except sqlite3.IntegrityError as exc:
+        # The partial unique index is the final guard against simultaneous check-ins.
+        if "idx_one_open_shift_per_worker" in str(exc) or "UNIQUE constraint failed: shifts.worker_id" in str(exc):
+            raise HTTPException(409, "Already checked in") from exc
+        raise
     return {"status": "checked_in", "at": tu.iso(now), "method": method}
 
 
@@ -159,8 +166,10 @@ def check_out(claims=Depends(worker_claims), db=Depends(get_db)):
     if not open_:
         raise HTTPException(409, "You are not checked in")
     now = tu.now()
-    db.execute("UPDATE shifts SET check_out=? WHERE id=?", (tu.iso(now), open_["id"]))
     hrs = payroll.shift_hours(tu.parse(open_["check_in"]), now)
+    if hrs > 20:
+        raise HTTPException(409, "This shift is over 20 hours old and needs supervisor review before checkout")
+    db.execute("UPDATE shifts SET check_out=? WHERE id=?", (tu.iso(now), open_["id"]))
     return {"status": "checked_out", "hours": round(hrs, 2),
             "overtime_hours": round(max(0, hrs - w["std_daily_hours"]), 2)}
 

@@ -174,7 +174,7 @@ def test_both_interfaces_are_served(client):
 
 def test_meta_hides_admin_password_when_configured(client):
     m = client.get("/api/meta").json()
-    assert m["demo"] is True and m["admin_hint"] is None
+    assert m["demo"] is True and "admin_hint" not in m and "admin-pass" not in str(m)
 
 
 def test_old_database_is_migrated(tmp_path):
@@ -211,3 +211,30 @@ def test_parallel_requests_like_a_real_browser(admin):
 def test_security_headers(client):
     r = client.get("/")
     assert "default-src 'self'" in r.headers["content-security-policy"]
+
+
+def test_overnight_shift_is_split_at_local_midnight():
+    # UTC+05:30: 20:00 UTC is 01:30 local; this shift crosses local midnight.
+    start = datetime(2026, 10, 5, 18, 30, tzinfo=UTC)  # local 00:00 next day
+    end = datetime(2026, 10, 6, 4, 30, tzinfo=UTC)    # local 10:00
+    p = payroll.compute_payslip([(start, end)], rate=100, std_hours=8, ot_mult=2, tz_min=330)
+    assert p["days_worked"] == 1
+    assert p["regular_hours"] == 8 and p["overtime_hours"] == 2
+
+
+def test_payslip_rejects_reversed_shift_interval():
+    start, end = dt(6, 12), dt(6, 10)
+    import pytest
+    with pytest.raises(ValueError):
+        payroll.compute_payslip([(start, end)], rate=100, std_hours=8, ot_mult=2, tz_min=330)
+
+
+def test_meta_never_discloses_admin_password(client):
+    body = client.get("/api/meta").json()
+    assert "admin_hint" not in body
+    assert "admin-pass" not in str(body)
+
+
+def test_readiness_endpoint(client):
+    r = client.get("/readyz")
+    assert r.status_code == 200 and r.json()["ready"] is True

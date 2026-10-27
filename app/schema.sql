@@ -16,6 +16,9 @@ CREATE TABLE IF NOT EXISTS shifts(
   site_id INTEGER NOT NULL REFERENCES sites(id),
   check_in TEXT NOT NULL, check_out TEXT, method TEXT, auto_closed INTEGER DEFAULT 0);
 CREATE INDEX IF NOT EXISTS idx_shifts_worker ON shifts(worker_id, check_in);
+-- Invariant: one active shift per worker, even under concurrent requests.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_one_open_shift_per_worker
+  ON shifts(worker_id) WHERE check_out IS NULL;
 CREATE TABLE IF NOT EXISTS safety_reports(
   id INTEGER PRIMARY KEY, worker_id INTEGER NOT NULL REFERENCES workers(id),
   site_id INTEGER NOT NULL REFERENCES sites(id),
