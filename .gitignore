@@ -3,3 +3,39 @@
 __pycache__/
 .pytest_cache/
 .venv/
+
+# Python virtual environment
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local environment secrets
+.env
+
+# Local databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Python virtual environment
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local environment secrets
+.env
+
+# Local databases
+*.db
+*.sqlite
+*.sqlite3
