@@ -238,3 +238,107 @@ def test_meta_never_discloses_admin_password(client):
 def test_readiness_endpoint(client):
     r = client.get("/readyz")
     assert r.status_code == 200 and r.json()["ready"] is True
+
+
+# ---------- efficiency / robustness regressions ----------
+def test_login_throttle_expires_resets_and_stays_bounded():
+    import pytest
+    from fastapi import HTTPException
+
+    from app.security import LoginThrottle
+    now = [0.0]
+    th = LoginThrottle(limit=3, window_s=60, max_keys=5, clock=lambda: now[0])
+    for _ in range(3):
+        th.record_failure("a")
+    with pytest.raises(HTTPException) as exc:
+        th.check("a")
+    assert exc.value.status_code == 429
+    now[0] = 61  # window elapsed: allowed again
+    th.check("a")
+    for _ in range(3):
+        th.record_failure("a")
+    th.reset("a")  # a successful login clears the counter
+    th.check("a")
+    for i in range(5):
+        th.record_failure(f"k{i}")
+    now[0] = 500  # all earlier entries are stale; the next insert sweeps them so memory cannot grow unbounded
+    th.record_failure("fresh")
+    assert len(th) == 1
+
+
+def test_month_bounds_respect_local_timezone():
+    start, end = tu.month_bounds(2026, 12, 330)  # IST: local Dec 1 00:00 == Nov 30 18:30 UTC
+    assert start == datetime(2026, 11, 30, 18, 30, tzinfo=UTC)
+    assert end == datetime(2026, 12, 31, 18, 30, tzinfo=UTC)
+
+
+def test_attendance_trend_counts_distinct_workers_per_local_day(tmp_path):
+    import sqlite3
+
+    from app.db import SCHEMA_SQL
+    from app.services import workforce
+    db = sqlite3.connect(tmp_path / "t.db")
+    db.row_factory = sqlite3.Row
+    db.executescript(SCHEMA_SQL)
+    db.execute("INSERT INTO sites(id,name,sector,qr_secret) VALUES(1,'S','factory','x')")
+    for i in (1, 2, 3):
+        db.execute("INSERT INTO workers(id,code,name,pin_hash,site_id,hourly_rate,joined_on) "
+                   "VALUES(?,?,?,'h',1,100,'2026-01-01')", (i, f"W{i}", f"W{i}"))
+    # Local time is UTC+05:30. Worker 1 has two shifts that fall on local Oct 20 (one starts at 01:30 local,
+    # i.e. 20:00 UTC the previous day); worker 3 starts at 23:30 local on Oct 19.
+    for wid, start in [(1, dt(19, 20)), (1, dt(20, 2)), (2, dt(20, 3)), (3, dt(19, 18))]:
+        db.execute("INSERT INTO shifts(worker_id,site_id,check_in,check_out) VALUES(?,1,?,?)",
+                   (wid, tu.iso(start), tu.iso(start + timedelta(hours=8))))
+    trend = workforce.attendance_trend(db, None, 3, now=dt(20, 12))
+    assert [(d["date"], d["present"], d["pct"]) for d in trend] == [
+        ("2026-10-18", 0, 0), ("2026-10-19", 1, 33), ("2026-10-20", 2, 67)]
+    assert workforce.attendance_trend(db, "hospital", 3, now=dt(20, 12))[-1]["total"] == 0
+
+
+def test_workforce_results_are_cached_briefly(client):
+    from app.db import connect
+    from app.services import workforce
+    conn = connect()
+    try:
+        first = workforce.compute_workforce(conn, "factory")
+        assert workforce.compute_workforce(conn, "factory") is first  # dashboard burst shares one computation
+        assert workforce.compute_workforce(conn, "factory", now=tu.now()) is not first  # explicit clock bypasses
+        workforce.clear_cache()
+        assert workforce.compute_workforce(conn, "factory") is not first
+    finally:
+        conn.close()
+
+
+def test_feedback_summary_attaches_comments_to_the_right_entry(client, admin):
+    fb = client.get("/api/admin/feedback", headers=admin).json()
+    assert fb
+    seeded = {"Shouts and ignores breaks", "Listens and explains clearly"}
+    conditions = {"No drinking water near the work area", "No water"}
+    for entry in fb:
+        assert len(entry["comments"]) <= 5
+        allowed = conditions if entry["manager"].startswith("Working conditions") else seeded
+        assert set(entry["comments"]) <= allowed
+
+
+def test_insights_top_reasons_are_ordered_by_frequency(client, admin):
+    from collections import Counter
+    top = client.get("/api/admin/insights", headers=admin).json()["aggregate"]["top_reasons"]
+    rows = client.get("/api/admin/attrition", headers=admin).json()
+    counts = Counter(r for row in rows for r in row["reasons"])
+    assert [counts[r] for r in top] == sorted(counts.values(), reverse=True)[:5]
+
+
+def test_safety_status_filter_is_validated(client, admin):
+    assert client.get("/api/admin/safety?status=bogus", headers=admin).status_code == 422
+    assert client.get("/api/admin/safety?status=open", headers=admin).status_code == 200
+
+
+def test_skill_dates_must_be_real_calendar_dates(client, admin):
+    body = {"worker_code": "FAC01", "name": "CNC level 3", "kind": "training"}
+    assert client.post("/api/admin/skills", headers=admin, json={**body, "issued_on": "2026-13-45"}).status_code == 422
+    assert client.post("/api/admin/skills", headers=admin, json={**body, "issued_on": "2026-06-01"}).status_code == 200
+
+
+def test_static_assets_are_gzip_compressed(client):
+    r = client.get("/static/js/worker.js", headers={"Accept-Encoding": "gzip"})
+    assert r.status_code == 200 and r.headers.get("content-encoding") == "gzip"

@@ -4,31 +4,38 @@ import io
 import math
 import re
 import sqlite3
-import time
-from datetime import datetime, timedelta
+from collections import Counter, defaultdict
+from datetime import date, timedelta
+from functools import lru_cache
 from typing import Literal
 
 import segno
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from . import timeutil as tu
 from .config import settings
 from .db import get_db
-from .security import admin_claims, make_token, verify_pin, worker_claims
+from .security import admin_claims, login_throttle, make_token, verify_pin, worker_claims
 from .services import analytics, gemini, i18n, payroll, workforce
+from .services.workforce import SECTOR_CLAUSE
 
 router = APIRouter(prefix="/api")
-SECTORS = {"construction", "factory", "hospital", "education"}
-_fails: dict[str, list[float]] = {}
+
+SECTORS = frozenset({"construction", "factory", "hospital", "education"})
+Status = Literal["open", "acknowledged", "in_progress", "resolved"]
+STALE_SHIFT_HOURS = 20          # an open shift older than this is auto-closed on check-in / needs review on check-out
+URGENT_SEVERITIES = frozenset({"high", "critical"})
+URGENT_OVERDUE = timedelta(days=2)
+NORMAL_OVERDUE = timedelta(days=7)
+SEVERITY_ORDER = "CASE r.severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END"
+MONTH_RE = re.compile(r"\d{4}-(0[1-9]|1[0-2])")
+COMMENTS_PER_ENTRY = 5
 
 
 # ---------- helpers ----------
-def _throttle(key: str) -> None:
-    now = time.time()
-    _fails[key] = [t for t in _fails.get(key, []) if now - t < 60]
-    if len(_fails[key]) >= 5:
-        raise HTTPException(429, "Too many attempts. Wait a minute.")
+def _client_ip(request: Request) -> str:
+    return request.client.host if request.client else "?"
 
 
 def _sector(sector: str | None) -> str | None:
@@ -54,17 +61,19 @@ def _haversine_m(lat1, lng1, lat2, lng2) -> float:
     return 6371000 * 2 * math.asin(math.sqrt(a))
 
 
-def _overdue(severity: str, status: str, created: str) -> bool:
+def _overdue(severity: str, status: str, created: str, now) -> bool:
     """Escalation rule: high/critical hazards unresolved > 2 days, others > 7 days."""
     if status == "resolved":
         return False
-    limit = timedelta(days=2) if severity in ("high", "critical") else timedelta(days=7)
-    return tu.now() - tu.parse(created) > limit
+    return now - tu.parse(created) > (URGENT_OVERDUE if severity in URGENT_SEVERITIES else NORMAL_OVERDUE)
 
 
-def _hours(row) -> float:
-    return payroll.shift_hours(tu.parse(row["check_in"]),
-                               tu.parse(row["check_out"]) if row["check_out"] else tu.now())
+def _hours(row, now) -> float:
+    return payroll.shift_hours(tu.parse(row["check_in"]), tu.parse(row["check_out"]) if row["check_out"] else now)
+
+
+def _count_high(wf: list[dict], kind: str) -> int:
+    return sum(x[kind]["level"] == "high" for x in wf)
 
 
 @router.get("/meta")
@@ -84,22 +93,25 @@ class AdminLogin(BaseModel):
 
 @router.post("/auth/worker")
 def login_worker(body: WorkerLogin, request: Request, db=Depends(get_db)):
-    key = f"w:{request.client.host if request.client else '?'}:{body.code.upper()}"
-    _throttle(key)
-    w = db.execute("SELECT id, pin_hash, language FROM workers WHERE code=?", (body.code.strip().upper(),)).fetchone()
+    code = body.code.strip().upper()
+    key = f"w:{_client_ip(request)}:{code}"
+    login_throttle.check(key)
+    w = db.execute("SELECT id, pin_hash, language FROM workers WHERE code=?", (code,)).fetchone()
     if not verify_pin(body.pin, w["pin_hash"] if w else None):
-        _fails.setdefault(key, []).append(time.time())
+        login_throttle.record_failure(key)
         raise HTTPException(401, "Wrong code or PIN")
+    login_throttle.reset(key)
     return {"token": make_token(w["id"], "worker"), "language": w["language"]}
 
 
 @router.post("/auth/admin")
 def login_admin(body: AdminLogin, request: Request):
-    key = f"a:{request.client.host if request.client else '?'}"
-    _throttle(key)
+    key = f"a:{_client_ip(request)}"
+    login_throttle.check(key)
     if not hmac.compare_digest(body.password.encode(), settings.admin_password.encode()):
-        _fails.setdefault(key, []).append(time.time())
+        login_throttle.record_failure(key)
         raise HTTPException(401, "Wrong password")
+    login_throttle.reset(key)
     return {"token": make_token(0, "admin")}
 
 
@@ -118,36 +130,39 @@ class CheckIn(BaseModel):
     lng: float | None = Field(None, ge=-180, le=180)
 
 
-def _open_shift(db, wid):
-    return db.execute("SELECT * FROM shifts WHERE worker_id=? AND check_out IS NULL ORDER BY id DESC",
-                      (wid,)).fetchone()
+def _open_shift(db, worker_id: int):
+    # The partial unique index guarantees at most one open shift per worker.
+    return db.execute("SELECT * FROM shifts WHERE worker_id=? AND check_out IS NULL", (worker_id,)).fetchone()
 
 
-@router.post("/shifts/check-in")
-def check_in(body: CheckIn, claims=Depends(worker_claims), db=Depends(get_db)):
-    w = _me(db, claims)
-    method = None
+def _verify_presence(body: CheckIn, w: dict) -> str:
+    """Return the check-in method ('qr' or 'location') or raise if the worker cannot prove presence."""
     if body.qr:
         parts = body.qr.split("|")
         ok = (len(parts) == 3 and parts[0] == "FS" and parts[1] == str(w["site_id"])
               and hmac.compare_digest(parts[2], w["qr_secret"]))
         if not ok:
             raise HTTPException(403, "This QR is not for your site")
-        method = "qr"
-    elif body.lat is not None and body.lng is not None and w["lat"] is not None:
+        return "qr"
+    if body.lat is not None and body.lng is not None and w["lat"] is not None:
         if _haversine_m(body.lat, body.lng, w["lat"], w["lng"]) > w["radius_m"]:
             raise HTTPException(403, "You are too far from the site")
-        method = "location"
-    else:
-        raise HTTPException(400, "Scan the site QR or share your location")
+        return "location"
+    raise HTTPException(400, "Scan the site QR or share your location")
+
+
+@router.post("/shifts/check-in")
+def check_in(body: CheckIn, claims=Depends(worker_claims), db=Depends(get_db)):
+    w = _me(db, claims)
+    method = _verify_presence(body, w)
     now = tu.now()
     open_ = _open_shift(db, w["id"])
     if open_:
-        cin = tu.parse(open_["check_in"])
-        if now - cin < timedelta(hours=20):
+        started = tu.parse(open_["check_in"])
+        if now - started < timedelta(hours=STALE_SHIFT_HOURS):
             raise HTTPException(409, "Already checked in")
         db.execute("UPDATE shifts SET check_out=?, auto_closed=1 WHERE id=?",
-                   (tu.iso(cin + timedelta(hours=w["std_daily_hours"])), open_["id"]))
+                   (tu.iso(started + timedelta(hours=w["std_daily_hours"])), open_["id"]))
     try:
         db.execute("INSERT INTO shifts(worker_id,site_id,check_in,method) VALUES(?,?,?,?)",
                    (w["id"], w["site_id"], tu.iso(now), method))
@@ -167,7 +182,7 @@ def check_out(claims=Depends(worker_claims), db=Depends(get_db)):
         raise HTTPException(409, "You are not checked in")
     now = tu.now()
     hrs = payroll.shift_hours(tu.parse(open_["check_in"]), now)
-    if hrs > 20:
+    if hrs > STALE_SHIFT_HOURS:
         raise HTTPException(409, "This shift is over 20 hours old and needs supervisor review before checkout")
     db.execute("UPDATE shifts SET check_out=? WHERE id=?", (tu.iso(now), open_["id"]))
     return {"status": "checked_out", "hours": round(hrs, 2),
@@ -177,28 +192,32 @@ def check_out(claims=Depends(worker_claims), db=Depends(get_db)):
 @router.get("/shifts/mine")
 def my_shifts(days: int = Query(14, ge=1, le=60), claims=Depends(worker_claims), db=Depends(get_db)):
     w = _me(db, claims)
-    rows = db.execute("SELECT * FROM shifts WHERE worker_id=? AND check_in>=? ORDER BY check_in DESC",
-                      (w["id"], tu.iso(tu.now() - timedelta(days=days)))).fetchall()
+    now = tu.now()
+    rows = db.execute("SELECT check_in,check_out FROM shifts WHERE worker_id=? AND check_in>=? ORDER BY check_in DESC",
+                      (w["id"], tu.iso(now - timedelta(days=days)))).fetchall()
+    shifts = []
+    for r in rows:
+        hrs = _hours(r, now)
+        shifts.append({"check_in": r["check_in"], "check_out": r["check_out"], "hours": round(hrs, 2),
+                       "overtime_hours": round(max(0, hrs - w["std_daily_hours"]), 2)})
     open_ = next((r for r in rows if not r["check_out"]), None)
-    return {"on_shift": bool(open_), "since": open_["check_in"] if open_ else None,
-            "std_hours": w["std_daily_hours"],
-            "shifts": [{"check_in": r["check_in"], "check_out": r["check_out"], "hours": round(_hours(r), 2),
-                        "overtime_hours": round(max(0, _hours(r) - w["std_daily_hours"]), 2)} for r in rows]}
+    return {"on_shift": open_ is not None, "since": open_["check_in"] if open_ else None,
+            "std_hours": w["std_daily_hours"], "shifts": shifts}
 
 
 # ---------- worker: payslip ----------
-def _payslip(db, w, month: str) -> dict:
-    if not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", month):
+def _payslip(db, w: dict, month: str) -> dict:
+    if not MONTH_RE.fullmatch(month):
         raise HTTPException(400, "month must be YYYY-MM")
-    y, m = int(month[:4]), int(month[5:])
-    off = timedelta(minutes=settings.tz_offset_min)
-    start = datetime(y, m, 1, tzinfo=tu.UTC) - off
-    end = (datetime(y + (m == 12), m % 12 + 1, 1, tzinfo=tu.UTC)) - off
+    start, end = tu.month_bounds(int(month[:4]), int(month[5:]), settings.tz_offset_min)
     rows = db.execute("SELECT check_in,check_out FROM shifts WHERE worker_id=? AND check_in>=? AND check_in<? "
                       "AND check_out IS NOT NULL", (w["id"], tu.iso(start), tu.iso(end))).fetchall()
     shifts = [(tu.parse(r["check_in"]), tu.parse(r["check_out"])) for r in rows]
-    return payroll.compute_payslip(shifts, w["hourly_rate"], w["std_daily_hours"], w["ot_multiplier"],
-                                   settings.tz_offset_min)
+    try:
+        return payroll.compute_payslip(shifts, w["hourly_rate"], w["std_daily_hours"], w["ot_multiplier"],
+                                       settings.tz_offset_min)
+    except ValueError as exc:  # corrupt interval or invalid pay configuration: needs a human, not a 500
+        raise HTTPException(422, "Payslip cannot be calculated until attendance or pay settings are reviewed") from exc
 
 
 @router.get("/payslip")
@@ -282,11 +301,13 @@ def feedback(body: FeedbackIn, claims=Depends(worker_claims), db=Depends(get_db)
         mid = m["id"]
     week = tu.iso_week(tu.now())
     # One-way token limits spam to 1 review / manager / week. The worker id itself is NEVER stored.
-    dedupe = hmac.new(settings.secret_key.encode(), f"{w['id']}|{mid or 'site'}|{week}".encode(), hashlib.sha256).hexdigest()
+    dedupe = hmac.new(settings.secret_key.encode(), f"{w['id']}|{mid or 'site'}|{week}".encode(),
+                      hashlib.sha256).hexdigest()
     if db.execute("SELECT 1 FROM feedback WHERE dedupe_hash=?", (dedupe,)).fetchone():
         raise HTTPException(409, "You already sent this review this week")
     comment = body.comment.strip()
-    db.execute("INSERT INTO feedback(site_id,manager_id,topic,rating,comment,sentiment,week,dedupe_hash) VALUES(?,?,?,?,?,?,?,?)",
+    db.execute("INSERT INTO feedback(site_id,manager_id,topic,rating,comment,sentiment,week,dedupe_hash) "
+               "VALUES(?,?,?,?,?,?,?,?)",
                (w["site_id"], mid, "manager" if mid else "conditions", body.rating, comment,
                 gemini.sentiment(comment, body.rating), week, dedupe))
     return {"status": "received"}
@@ -298,7 +319,7 @@ def passport(claims=Depends(worker_claims), db=Depends(get_db)):
     w = _me(db, claims)
     skills = [dict(r) for r in db.execute(
         "SELECT name,kind,issuer,issued_on,expires_on FROM skills WHERE worker_id=? ORDER BY issued_on DESC", (w["id"],))]
-    tenure = db.execute("SELECT COUNT(*) c FROM shifts WHERE worker_id=? AND check_out IS NOT NULL", (w["id"],)).fetchone()["c"]
+    tenure = db.execute("SELECT COUNT(*) FROM shifts WHERE worker_id=? AND check_out IS NOT NULL", (w["id"],)).fetchone()[0]
     return {"name": w["name"], "code": w["code"], "job_title": w["job_title"], "sector": w["sector"],
             "employer_site": w["site_name"], "joined_on": w["joined_on"], "verified_shifts": tenure, "skills": skills}
 
@@ -309,36 +330,41 @@ def admin_sites(_=Depends(admin_claims), db=Depends(get_db)):
     return [dict(r) for r in db.execute("SELECT id,name,sector FROM sites ORDER BY sector,name")]
 
 
+@lru_cache(maxsize=64)
+def _qr_svg(payload: str) -> bytes:
+    buf = io.BytesIO()
+    segno.make(payload, error="m").save(buf, kind="svg", scale=8, border=2)
+    return buf.getvalue()
+
+
 @router.get("/admin/sites/{site_id}/qr.svg")
 def site_qr(site_id: int, _=Depends(admin_claims), db=Depends(get_db)):
     s = db.execute("SELECT id,qr_secret FROM sites WHERE id=?", (site_id,)).fetchone()
     if not s:
         raise HTTPException(404, "No such site")
-    buf = io.BytesIO()
-    segno.make(f"FS|{s['id']}|{s['qr_secret']}", error="m").save(buf, kind="svg", scale=8, border=2)
-    return Response(buf.getvalue(), media_type="image/svg+xml", headers={"Cache-Control": "no-store"})
+    return Response(_qr_svg(f"FS|{s['id']}|{s['qr_secret']}"), media_type="image/svg+xml",
+                    headers={"Cache-Control": "no-store"})
 
 
 @router.get("/admin/overview")
 def overview(sector: str | None = None, _=Depends(admin_claims), db=Depends(get_db)):
     sec = _sector(sector)
+    params = {"sector": sec}
+    now = tu.now()
     wf = workforce.compute_workforce(db, sec)
-    f = " AND s.sector=?" if sec else ""
-    a = (sec,) if sec else ()
-    on_shift = db.execute("SELECT COUNT(*) c FROM shifts sh JOIN sites s ON s.id=sh.site_id "
-                          "WHERE sh.check_out IS NULL" + f, a).fetchone()["c"]
-    open_safety = db.execute("SELECT COUNT(*) c FROM safety_reports r JOIN sites s ON s.id=r.site_id "
-                             "WHERE r.status!='resolved'" + f, a).fetchone()["c"]
-    avg = db.execute("SELECT AVG(rating) r FROM feedback fb JOIN sites s ON s.id=fb.site_id "
-                     "WHERE fb.manager_id IS NOT NULL" + f, a).fetchone()["r"]
-    overdue = sum(_overdue(r["severity"], r["status"], r["created_at"]) for r in db.execute(
-        "SELECT r.severity,r.status,r.created_at FROM safety_reports r JOIN sites s ON s.id=r.site_id "
-        "WHERE r.status!='resolved'" + f, a))
-    today = workforce.attendance_trend(db, sec, 1)[-1]
-    return {"sector": sec or "all", "workers": len(wf), "on_shift_now": on_shift, "attendance_today_pct": today["pct"],
-            "high_fatigue": sum(x["fatigue"]["level"] == "high" for x in wf),
-            "high_attrition": sum(x["attrition"]["level"] == "high" for x in wf),
-            "open_safety": open_safety, "overdue_safety": overdue, "avg_rating": round(avg, 2) if avg else None}
+    on_shift = db.execute("SELECT COUNT(*) FROM shifts sh JOIN sites s ON s.id=sh.site_id "
+                          f"WHERE sh.check_out IS NULL AND {SECTOR_CLAUSE}", params).fetchone()[0]
+    avg = db.execute("SELECT AVG(rating) FROM feedback fb JOIN sites s ON s.id=fb.site_id "
+                     f"WHERE fb.manager_id IS NOT NULL AND {SECTOR_CLAUSE}", params).fetchone()[0]
+    open_reports = db.execute("SELECT r.severity,r.status,r.created_at FROM safety_reports r "
+                              f"JOIN sites s ON s.id=r.site_id WHERE r.status!='resolved' AND {SECTOR_CLAUSE}",
+                              params).fetchall()
+    overdue = sum(_overdue(r["severity"], r["status"], r["created_at"], now) for r in open_reports)
+    today = workforce.attendance_trend(db, sec, 1, now)[-1]
+    return {"sector": sec or "all", "workers": len(wf), "on_shift_now": on_shift,
+            "attendance_today_pct": today["pct"], "high_fatigue": _count_high(wf, "fatigue"),
+            "high_attrition": _count_high(wf, "attrition"), "open_safety": len(open_reports),
+            "overdue_safety": overdue, "avg_rating": round(avg, 2) if avg else None}
 
 
 @router.get("/admin/attendance-trend")
@@ -362,25 +388,21 @@ def attrition_list(sector: str | None = None, _=Depends(admin_claims), db=Depend
 
 
 @router.get("/admin/safety")
-def admin_safety(sector: str | None = None, status: str | None = None, _=Depends(admin_claims), db=Depends(get_db)):
-    sec = _sector(sector)
-    sql = ("SELECT r.id,r.category,r.severity,r.location,r.summary,r.description,r.status,r.admin_note,r.created_at,"
-           "s.name site,s.sector,w.code worker FROM safety_reports r JOIN sites s ON s.id=r.site_id "
-           "JOIN workers w ON w.id=r.worker_id WHERE 1=1")
-    args: list = []
-    if sec:
-        sql += " AND s.sector=?"; args.append(sec)
-    if status:
-        sql += " AND r.status=?"; args.append(status)
-    order = "CASE r.severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, r.id DESC"
-    rows = [dict(r) for r in db.execute(sql + " ORDER BY " + order + " LIMIT 100", args)]
+def admin_safety(sector: str | None = None, status: Status | None = None, _=Depends(admin_claims),
+                 db=Depends(get_db)):
+    now = tu.now()
+    rows = [dict(r) for r in db.execute(
+        "SELECT r.id,r.category,r.severity,r.location,r.summary,r.description,r.status,r.admin_note,r.created_at,"
+        "s.name site,s.sector,w.code worker FROM safety_reports r JOIN sites s ON s.id=r.site_id "
+        f"JOIN workers w ON w.id=r.worker_id WHERE {SECTOR_CLAUSE} AND (:status IS NULL OR r.status=:status) "
+        f"ORDER BY {SEVERITY_ORDER}, r.id DESC LIMIT 100", {"sector": _sector(sector), "status": status})]
     for r in rows:
-        r["overdue"] = _overdue(r["severity"], r["status"], r["created_at"])
+        r["overdue"] = _overdue(r["severity"], r["status"], r["created_at"], now)
     return rows
 
 
 class StatusIn(BaseModel):
-    status: Literal["open", "acknowledged", "in_progress", "resolved"]
+    status: Status
     admin_note: str | None = Field(None, max_length=300)
 
 
@@ -393,33 +415,46 @@ def update_safety(rid: int, body: StatusIn, _=Depends(admin_claims), db=Depends(
     return {"id": rid, "status": body.status}
 
 
+def _recent_comments(db, key: str, ids: list[int], where: str = "1=1") -> dict[int, list[str]]:
+    """Latest non-empty comments for many managers/sites in ONE query (window function, no N+1).
+
+    `key` and `where` are internal constants, never user input.
+    """
+    if not ids:
+        return {}
+    marks = ",".join("?" * len(ids))
+    rows = db.execute(
+        f"SELECT k, comment FROM (SELECT {key} k, comment, ROW_NUMBER() OVER (PARTITION BY {key} ORDER BY id DESC) rn "
+        f"FROM feedback WHERE comment!='' AND {where} AND {key} IN ({marks})) WHERE rn<=? ORDER BY k, rn",
+        [*ids, COMMENTS_PER_ENTRY])
+    out: dict[int, list[str]] = defaultdict(list)
+    for r in rows:
+        out[r["k"]].append(r["comment"])
+    return out
+
+
 @router.get("/admin/feedback")
 def feedback_summary(sector: str | None = None, _=Depends(admin_claims), db=Depends(get_db)):
-    """Managers with fewer than 3 reviews are hidden so a single worker can't be identified."""
-    sec = _sector(sector)
-    sql = ("SELECT m.id,m.name,s.name site,s.sector,COUNT(*) n,AVG(fb.rating) avg_rating,AVG(fb.sentiment) sentiment "
-           "FROM feedback fb JOIN managers m ON m.id=fb.manager_id JOIN sites s ON s.id=fb.site_id WHERE 1=1")
-    args: list = []
-    if sec:
-        sql += " AND s.sector=?"; args.append(sec)
-    out = []
-    for r in db.execute(sql + " GROUP BY m.id HAVING COUNT(*)>=3 ORDER BY avg_rating", args):
-        comments = [c["comment"] for c in db.execute(
-            "SELECT comment FROM feedback WHERE manager_id=? AND comment!='' ORDER BY id DESC LIMIT 5", (r["id"],))]
-        out.append({"manager": r["name"], "site": r["site"], "sector": r["sector"], "reviews": r["n"],
-                    "avg_rating": round(r["avg_rating"], 2), "sentiment": round(r["sentiment"] or 0, 2),
-                    "comments": comments})
-    csql = ("SELECT s.name site,s.sector,COUNT(*) n,AVG(fb.rating) r,AVG(fb.sentiment) se FROM feedback fb "
-            "JOIN sites s ON s.id=fb.site_id WHERE fb.topic='conditions'")
-    if sec:
-        csql += " AND s.sector=?"
-    for r in db.execute(csql + " GROUP BY s.id HAVING COUNT(*)>=3", args):
-        cm = [c["comment"] for c in db.execute(
-            "SELECT comment FROM feedback WHERE topic='conditions' AND comment!='' AND site_id=(SELECT id FROM sites WHERE name=?) "
-            "ORDER BY id DESC LIMIT 5", (r["site"],))]
-        out.append({"manager": "Working conditions (whole site)", "site": r["site"], "sector": r["sector"],
-                    "reviews": r["n"], "avg_rating": round(r["r"], 2), "sentiment": round(r["se"] or 0, 2), "comments": cm})
-    return out
+    """Managers/sites with fewer than 3 reviews are hidden so a single worker can't be identified."""
+    params = {"sector": _sector(sector), "min_reviews": workforce.MIN_REVIEWS}
+    managers = db.execute(
+        "SELECT m.id,m.name,s.name site,s.sector,COUNT(*) n,AVG(fb.rating) avg_rating,AVG(fb.sentiment) sentiment "
+        "FROM feedback fb JOIN managers m ON m.id=fb.manager_id JOIN sites s ON s.id=fb.site_id "
+        f"WHERE {SECTOR_CLAUSE} GROUP BY m.id HAVING COUNT(*)>=:min_reviews ORDER BY avg_rating", params).fetchall()
+    sites = db.execute(
+        "SELECT s.id,s.name site,s.sector,COUNT(*) n,AVG(fb.rating) avg_rating,AVG(fb.sentiment) sentiment "
+        "FROM feedback fb JOIN sites s ON s.id=fb.site_id "
+        f"WHERE fb.topic='conditions' AND {SECTOR_CLAUSE} GROUP BY s.id HAVING COUNT(*)>=:min_reviews",
+        params).fetchall()
+    manager_comments = _recent_comments(db, "manager_id", [m["id"] for m in managers])
+    site_comments = _recent_comments(db, "site_id", [s["id"] for s in sites], "topic='conditions'")
+
+    def entry(label, r, comments):
+        return {"manager": label, "site": r["site"], "sector": r["sector"], "reviews": r["n"],
+                "avg_rating": round(r["avg_rating"], 2), "sentiment": round(r["sentiment"] or 0, 2),
+                "comments": comments}
+    return ([entry(m["name"], m, manager_comments.get(m["id"], [])) for m in managers]
+            + [entry("Working conditions (whole site)", s, site_comments.get(s["id"], [])) for s in sites])
 
 
 class SkillIn(BaseModel):
@@ -429,6 +464,13 @@ class SkillIn(BaseModel):
     issuer: str | None = Field(None, max_length=80)
     issued_on: str | None = Field(None, pattern=r"^\d{4}-\d{2}-\d{2}$")
     expires_on: str | None = Field(None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+
+    @field_validator("issued_on", "expires_on")
+    @classmethod
+    def check_real_date(cls, value: str | None) -> str | None:
+        if value is not None:
+            date.fromisoformat(value)  # ValueError -> HTTP 422 for impossible dates such as 2026-13-45
+        return value
 
 
 @router.post("/admin/skills")
@@ -445,13 +487,13 @@ def add_skill(body: SkillIn, _=Depends(admin_claims), db=Depends(get_db)):
 def insights(sector: str | None = None, _=Depends(admin_claims), db=Depends(get_db)):
     sec = _sector(sector)
     wf = workforce.compute_workforce(db, sec)
-    agg = {"sector": sec or "all", "workers": len(wf),
-           "high_fatigue": sum(x["fatigue"]["level"] == "high" for x in wf),
-           "high_quit_risk": sum(x["attrition"]["level"] == "high" for x in wf),
-           "top_reasons": sorted({r for x in wf for r in x["attrition"]["reasons"]})[:5]}
+    reasons = Counter(r for x in wf for r in x["attrition"]["reasons"])
+    agg = {"sector": sec or "all", "workers": len(wf), "high_fatigue": _count_high(wf, "fatigue"),
+           "high_quit_risk": _count_high(wf, "attrition"),
+           "top_reasons": [reason for reason, _ in reasons.most_common(5)]}  # most frequent first
     text = gemini.insights(agg)
     if not text:
         text = (f"{agg['high_fatigue']} of {agg['workers']} workers show high fatigue: cap overtime and enforce "
-                f"11-hour rest gaps. {agg['high_quit_risk']} are at high quit risk: hold stay-conversations, "
-                "resolve open safety reports and review low-rated managers.")
+                f"{analytics.MIN_REST_HOURS}-hour rest gaps. {agg['high_quit_risk']} are at high quit risk: hold "
+                "stay-conversations, resolve open safety reports and review low-rated managers.")
     return {"ai": gemini.available(), "text": text, "aggregate": agg}

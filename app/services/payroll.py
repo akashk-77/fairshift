@@ -10,6 +10,10 @@ ESI_RATE = 0.0075       # illustrative employee share, only if gross <= ESI_LIMI
 ESI_LIMIT = 21000.0
 
 
+def _r2(x: float) -> float:
+    return round(x, 2)
+
+
 def shift_hours(start: datetime, end: datetime) -> float:
     """Return non-negative elapsed hours; invalid/reversed intervals count as zero."""
     return max(0.0, (end - start).total_seconds() / 3600)
@@ -44,7 +48,7 @@ def compute_payslip(shifts: list[tuple[datetime, datetime]], rate: float,
     """
     if rate < 0 or std_hours <= 0 or ot_mult < 1:
         raise ValueError("rate must be non-negative, std_hours positive, and ot_mult >= 1")
-    per_day: dict = defaultdict(float)
+    per_day: defaultdict = defaultdict(float)
     for start, end in shifts:
         if end < start:
             raise ValueError("shift end must not be before shift start")
@@ -57,7 +61,6 @@ def compute_payslip(shifts: list[tuple[datetime, datetime]], rate: float,
     gross = basic + ot_pay
     pf = basic * PF_RATE
     esi = gross * ESI_RATE if gross <= ESI_LIMIT else 0.0
-    r = lambda x: round(x, 2)  # noqa: E731
-    return {"days_worked": len(per_day), "regular_hours": r(regular), "overtime_hours": r(overtime),
-            "rate": r(rate), "basic_pay": r(basic), "overtime_pay": r(ot_pay), "gross": r(gross),
-            "pf": r(pf), "esi": r(esi), "net": r(gross - pf - esi)}
+    return {"days_worked": len(per_day), "regular_hours": _r2(regular), "overtime_hours": _r2(overtime),
+            "rate": _r2(rate), "basic_pay": _r2(basic), "overtime_pay": _r2(ot_pay), "gross": _r2(gross),
+            "pf": _r2(pf), "esi": _r2(esi), "net": _r2(gross - pf - esi)}

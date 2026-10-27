@@ -7,12 +7,11 @@ function login() {
   $("#app").innerHTML = `<div class="card" style="max-width:420px;margin:10vh auto;border-top:8px solid var(--denim)"><h1>📊 Employer dashboard</h1>
     <p class="muted">For managers and HR. Workers use <a href="/worker">the worker app</a>.</p>
     <label>Password</label><input id="pw" type="password" autocomplete="current-password"><p class="err" id="err" role="alert"></p>
-    <button class="btn vest" id="go">Log in</button><p class="muted" id="hint"></p></div><p style="text-align:center"><a class="back" href="/">← FairShift home</a> · <a class="back" href="/worker">Worker app</a></p>`;
+    <button class="btn vest" id="go">Log in</button></div><p style="text-align:center"><a class="back" href="/">← FairShift home</a> · <a class="back" href="/worker">Worker app</a></p>`;
   $("#go").onclick = async () => {
     try { const r = await api("/api/auth/admin", {method: "POST", body: {password: $("#pw").value}}); sessionStorage.setItem(TK, r.token); dash(); }
     catch (e) { $("#err").textContent = e.message; }
   };
-  api("/api/meta").then(m => { if (m.admin_hint) $("#hint").textContent = "Demo password: " + m.admin_hint; }).catch(() => {});
   $("#pw").addEventListener("keydown", e => { if (e.key === "Enter") $("#go").click(); });
 }
 
@@ -68,6 +67,8 @@ async function dash() {
   $("#site").innerHTML = list.map(s => `<option value="${s.id}">${esc(s.name)}</option>`).join("");
   const showQr = async () => {
     const blob = await call(`/api/admin/sites/${$("#site").value}/qr.svg`);
+    const old = $("#qr img");
+    if (old) URL.revokeObjectURL(old.src);  // free the previous blob instead of leaking one per change
     $("#qr").innerHTML = `<img alt="Site QR" style="width:100%" src="${URL.createObjectURL(blob)}">`;
   };
   $("#site").onchange = showQr; if (list.length) showQr();
@@ -75,7 +76,9 @@ async function dash() {
     try { await call("/api/admin/skills", {method: "POST", body: {worker_code: $("#sc").value, name: $("#sn").value, kind: $("#sk").value, issuer: $("#si").value || null}});
       $("#smsg").className = "ok"; $("#smsg").textContent = "Added"; } catch (e) { $("#smsg").className = "err"; $("#smsg").textContent = e.message; }
   };
-  call(`/api/admin/insights${q}`).then(i => { $("#ins").style.whiteSpace = "pre-wrap"; $("#ins").textContent = i.text + (i.ai ? "" : "\n(Rule-based summary: add a Gemini key for AI insights.)"); });
+  call(`/api/admin/insights${q}`)
+    .then(i => { $("#ins").style.whiteSpace = "pre-wrap"; $("#ins").textContent = i.text + (i.ai ? "" : "\n(Rule-based summary: add a Gemini key for AI insights.)"); })
+    .catch(e => { $("#ins").textContent = e.message; });  // never leave "Loading…" hanging on an error
 }
 
 sessionStorage.getItem(TK) ? dash().catch(login) : login();

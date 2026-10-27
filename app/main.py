@@ -2,7 +2,8 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -29,22 +30,27 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="FairShift", version="1.0", lifespan=lifespan, docs_url="/api/docs", redoc_url=None)
+app.add_middleware(GZipMiddleware, minimum_size=1024)  # JS/CSS/HTML and JSON compress well; helps slow mobile links
 app.include_router(router)
 
 CSP = ("default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; "
        "script-src 'self'; connect-src 'self'; media-src 'self' blob:; frame-ancestors 'none'; base-uri 'none'")
+SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+    "Permissions-Policy": "camera=(self), microphone=(self), geolocation=(self)",
+}
 
 
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
     resp = await call_next(request)
-    if not request.url.path.startswith("/api/docs"):
+    path = request.url.path
+    if not path.startswith("/api/docs"):  # Swagger UI needs inline scripts and a CDN
         resp.headers["Content-Security-Policy"] = CSP
-    if not request.url.path.startswith("/api"):
+    if not path.startswith("/api"):
         resp.headers["Cache-Control"] = "no-cache"
-    resp.headers["X-Content-Type-Options"] = "nosniff"
-    resp.headers["Referrer-Policy"] = "no-referrer"
-    resp.headers["Permissions-Policy"] = "camera=(self), microphone=(self), geolocation=(self)"
+    resp.headers.update(SECURITY_HEADERS)
     return resp
 
 
@@ -57,7 +63,6 @@ def healthz():
 @app.get("/readyz")
 def readyz():
     """Readiness probe: verifies the configured database is reachable."""
-    from fastapi import HTTPException
     conn = connect()
     try:
         conn.execute("SELECT 1").fetchone()

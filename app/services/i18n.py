@@ -19,6 +19,7 @@ SUMMARY = {
     "te": "మీరు {days} రోజులు పని చేశారు, {ot} గంటలు ఓవర్‌టైమ్. మీ చేతికి ₹{net} వస్తుంది.",
 }
 LANG_NAME = {"en": "English", "hi": "Hindi", "ta": "Tamil", "te": "Telugu"}
+_LABEL_DICTS = {lang: dict(zip(KEYS, values)) for lang, values in LABELS.items()}  # built once, treat as read-only
 
 
 def norm(lang: str | None) -> str:
@@ -26,7 +27,7 @@ def norm(lang: str | None) -> str:
 
 
 def labels(lang: str) -> dict:
-    return dict(zip(KEYS, LABELS[norm(lang)]))
+    return _LABEL_DICTS[norm(lang)]
 
 
 def summary(lang: str, p: dict) -> str:

@@ -23,3 +23,11 @@ def local_date(dt: datetime, tz_min: int):
 def iso_week(dt: datetime) -> str:
     y, w, _ = dt.isocalendar()
     return f"{y}-W{w:02d}"
+
+
+def month_bounds(year: int, month: int, tz_min: int) -> tuple[datetime, datetime]:
+    """UTC instants bounding a local calendar month: [start, end)."""
+    offset = timedelta(minutes=tz_min)
+    first = datetime(year, month, 1, tzinfo=UTC)
+    following = datetime(year + (month == 12), month % 12 + 1, 1, tzinfo=UTC)
+    return first - offset, following - offset

@@ -11,6 +11,14 @@ from fastapi.testclient import TestClient  # noqa: E402
 from app.main import app  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _fresh_workforce_cache():
+    """Workforce analytics are cached for a few seconds in production; tests must not see each other's data."""
+    from app.services import workforce
+    workforce.clear_cache()
+    yield
+
+
 @pytest.fixture(scope="session")
 def client():
     with TestClient(app) as c:
